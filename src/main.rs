@@ -22,6 +22,8 @@ use crate::jobs::{Db, parse_webhook_headers};
 use crate::pipeline::{Pipeline, PipelineError};
 use crate::types::{QueryRequest, utc_now_millis};
 
+pub const PUBLIC_BASE_URL: &str = "https://baqs.spaza.co.ke";
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -48,7 +50,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0:8080".to_string(),
-            public_base_url: "http://127.0.0.1:8080".to_string(),
+            public_base_url: PUBLIC_BASE_URL.to_string(),
             api_token: String::new(),
             health_public: true,
             max_body_bytes: 1024 * 1024,
@@ -659,7 +661,7 @@ async fn shutdown_signal() {
 
 const CONFIG_TEMPLATE: &str = r#"[server]
 bind = "0.0.0.0:8080"
-public_base_url = "http://127.0.0.1:8080"
+public_base_url = "https://baqs.spaza.co.ke"
 api_token = "__API_TOKEN__"
 health_public = true
 max_body_bytes = 1048576
@@ -727,6 +729,7 @@ mod tests {
     fn parses_default_config() {
         let config: Config = toml::from_str(CONFIG_TEMPLATE).unwrap();
         assert_eq!(config.server.bind, "0.0.0.0:8080");
+        assert_eq!(config.server.public_base_url, PUBLIC_BASE_URL);
         assert_eq!(config.olaf.sample_rate, 16_000);
         assert_eq!(config.worker.concurrency, 1);
     }

@@ -290,7 +290,7 @@ echo "Environment:   $CONFIG_DIR/baqs.env"
 echo "Data:          $DATA_DIR"
 echo "Service:       $SERVICE_NAME"
 echo "Health:        http://127.0.0.1:8080/healthz"
-echo "Swagger:       http://127.0.0.1:8080/docs"
+echo "Swagger:       https://baqs.spaza.co.ke/docs"
 echo
 echo "Provision BAQS_S3_* values in $CONFIG_DIR/baqs.env before running queries."
 echo "  sudo systemctl status baqs"

@@ -65,8 +65,6 @@ pub struct QueryOptions {
     #[serde(default)]
     pub merge_gap_seconds: Option<f64>,
     #[serde(default)]
-    pub execution_timeout_seconds: Option<u64>,
-    #[serde(default)]
     pub max_chunks: Option<usize>,
     #[serde(default)]
     pub include_recording: Option<bool>,
@@ -79,7 +77,6 @@ impl Default for QueryOptions {
             minimum_match_count: None,
             max_results: None,
             merge_gap_seconds: None,
-            execution_timeout_seconds: None,
             max_chunks: None,
             include_recording: None,
         }

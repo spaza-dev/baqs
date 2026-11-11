@@ -71,6 +71,10 @@ if [[ -f "$CONFIG_DIR/baqs.env" ]]; then
     cp -a "$CONFIG_DIR/baqs.env" "$BACKUP_DIR/baqs.env"
 fi
 ln -sfn "$BACKUP_DIR" /var/backups/baqs/previous
+if grep -qx 'public_base_url = "http://127.0.0.1:8080"' "$CONFIG_DIR/config.toml"; then
+    sed -i 's|^public_base_url = "http://127.0.0.1:8080"$|public_base_url = "https://baqs.spaza.co.ke"|' "$CONFIG_DIR/config.toml"
+    echo "Updated public_base_url to https://baqs.spaza.co.ke."
+fi
 
 rollback() {
     echo "Rolling back to $BACKUP_DIR..." >&2

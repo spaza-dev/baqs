@@ -13,17 +13,21 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use utoipa::openapi::OpenApi;
+use utoipa::openapi::OpenApi as OpenApiDocument;
+use utoipa::openapi::Server;
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-use crate::Config;
 use crate::jobs::Db;
 use crate::pipeline::Pipeline;
 use crate::types::{
-    JobError, JobProgress, JobStatusResponse, JobSubmissionResponse, QUERY_CONTRACT_VERSION,
-    QueryRequest, QueryResult, utc_now_millis,
+    ArchiveReference, CatalogReference, IndexObjectReference, JobError, JobProgress,
+    JobStatusResponse, JobSubmissionResponse, Provenance, QUERY_CONTRACT_VERSION, QueryMatch,
+    QueryOptions, QueryRequest, QueryResult, QuerySummary, Recording, Stream, utc_now_millis,
 };
+use crate::{Config, PUBLIC_BASE_URL};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -123,8 +127,125 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct ErrorDetail {
+    code: String,
+    message: String,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct ErrorResponse {
+    error: ErrorDetail,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct HealthResponse {
+    status: String,
+    service: String,
+    short_name: String,
+    version: String,
+    uptime_seconds: u64,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct ReadinessResponse {
+    status: String,
+    #[schema(value_type = Object)]
+    checks: HashMap<String, Value>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct VersionResponse {
+    service: String,
+    short_name: String,
+    version: String,
+    contract_version: String,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct CancelResponse {
+    job_id: String,
+    status: String,
+    cancel_requested: bool,
+}
+
+struct SecuritySchemes;
+
+impl Modify for SecuritySchemes {
+    fn modify(&self, openapi: &mut OpenApiDocument) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer_auth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("API token")
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "x-api-key",
+                "BAQS API token supplied as an x-api-key header",
+            ))),
+        );
+    }
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Broadcast Archive Query Service (BAQS)",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "Asynchronous broadcast archive fingerprint search and query service.\n\nAuthentication: send `Authorization: Bearer <token>` or `x-api-key: <token>` on all `/v1/*` endpoints. Health endpoints are public by default. `GET /docs` and `GET /openapi.json` are public."
+    ),
+    paths(
+        submit_query,
+        submit_search,
+        get_job,
+        get_result,
+        cancel_job,
+        healthz,
+        readyz,
+        version
+    ),
+    components(schemas(
+        QueryRequest,
+        CatalogReference,
+        IndexObjectReference,
+        ArchiveReference,
+        QueryOptions,
+        JobSubmissionResponse,
+        JobStatusResponse,
+        JobProgress,
+        JobError,
+        QueryResult,
+        QueryMatch,
+        QuerySummary,
+        Recording,
+        Stream,
+        Provenance,
+        ErrorDetail,
+        ErrorResponse,
+        HealthResponse,
+        ReadinessResponse,
+        VersionResponse,
+        CancelResponse
+    )),
+    modifiers(&SecuritySchemes)
+)]
+struct ApiDoc;
+
 pub fn router(state: AppState) -> Router {
-    let document = openapi_document(&state.config.server.public_base_url);
+    let document = openapi_document();
+
     let swagger = SwaggerUi::new("/docs").url("/openapi.json", document);
     Router::new()
         .route("/healthz", get(healthz))
@@ -144,6 +265,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "health",
+    summary = "Process liveness",
+    description = "Public by default. Requires the API token when `server.health_public` is false.",
+    responses(
+        (status = 200, description = "Service is alive", body = HealthResponse),
+        (status = 401, description = "Health checks are protected and the token is missing or invalid", body = ErrorResponse)
+    )
+)]
 async fn healthz(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -158,6 +290,18 @@ async fn healthz(
     })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "health",
+    summary = "Readiness checks",
+    description = "Public by default. Requires the API token when `server.health_public` is false.",
+    responses(
+        (status = 200, description = "All readiness checks passed", body = ReadinessResponse),
+        (status = 401, description = "Health checks are protected and the token is missing or invalid", body = ErrorResponse),
+        (status = 503, description = "One or more readiness checks failed", body = ReadinessResponse)
+    )
+)]
 async fn readyz(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(error) = authorize_health(&state, &headers) {
         return error.into_response();
@@ -227,6 +371,15 @@ async fn readyz(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "health",
+    summary = "Service and contract version",
+    responses(
+        (status = 200, description = "Version information", body = VersionResponse)
+    )
+)]
 async fn version() -> Json<Value> {
     Json(json!({
         "service": "Broadcast Archive Query Service",
@@ -236,6 +389,47 @@ async fn version() -> Json<Value> {
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/search",
+    tag = "query",
+    summary = "Submit an asynchronous archive search",
+    description = "Alias of `POST /v1/query`. Creates a background job with kind `search` and returns immediately.",
+    request_body(
+        content = QueryRequest,
+        description = "Search request. Supply a stream selector plus either `month` or `start`/`end`, and either `catalog[].audio_url` or a top-level `audio_url`.",
+        example = json!({
+            "contract_version": "2",
+            "request_id": "sample-search-001",
+            "stream_id": "stream-1",
+            "month": "2026-11",
+            "recording_id": "rec-1",
+            "title": "Example recording",
+            "audio_url": "https://example.com/recording.mp3",
+            "options": {
+                "minimum_confidence": 0.5,
+                "minimum_match_count": 6,
+                "max_results": 100,
+                "include_recording": true
+            }
+        })
+    ),
+    responses(
+        (status = 202, description = "Job accepted", body = JobSubmissionResponse,
+            example = json!({
+                "contract_version": "2",
+                "request_id": "sample-search-001",
+                "job_id": "8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10",
+                "status": "accepted",
+                "status_url": "https://baqs.spaza.co.ke/v1/jobs/8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10",
+                "result_url": "https://baqs.spaza.co.ke/v1/jobs/8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10/result"
+            })),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
 async fn submit_search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -248,6 +442,57 @@ async fn submit_search(
     submit(state, request, "search").await
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/query",
+    tag = "query",
+    summary = "Submit an asynchronous platform query (contract v2)",
+    description = "Creates a background job that discovers archive chunks, merges Olaf indexes, and queries them. Poll `status_url` or fetch `result_url` when complete.",
+    request_body(
+        content = QueryRequest,
+        description = "Query request. `contract_version` must be `2`. Supply a stream selector plus either `month` or `start`/`end`, and either `catalog[].audio_url` or a top-level `audio_url`.",
+        example = json!({
+            "contract_version": "2",
+            "request_id": "sample-query-001",
+            "stream_ids": ["stream-1"],
+            "start": "2026-11-01T00:00:00Z",
+            "end": "2026-11-02T00:00:00Z",
+            "catalog": [
+                {
+                    "catalog_item_id": "cat-1",
+                    "name": "Example track",
+                    "type": "music",
+                    "metadata": {},
+                    "fingerprint_reference": null,
+                    "audio_url": "https://example.com/track.mp3"
+                }
+            ],
+            "options": {
+                "minimum_confidence": 0.5,
+                "minimum_match_count": 6,
+                "max_results": 100,
+                "merge_gap_seconds": 2.0,
+                "max_chunks": 100000,
+                "include_recording": true
+            }
+        })
+    ),
+    responses(
+        (status = 202, description = "Job accepted", body = JobSubmissionResponse,
+            example = json!({
+                "contract_version": "2",
+                "request_id": "sample-query-001",
+                "job_id": "8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10",
+                "status": "accepted",
+                "status_url": "https://baqs.spaza.co.ke/v1/jobs/8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10",
+                "result_url": "https://baqs.spaza.co.ke/v1/jobs/8f2b2f0e-4c8b-4d46-9f1c-4f4f1a5f2a10/result"
+            })),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
 async fn submit_query(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -292,6 +537,20 @@ async fn submit(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/jobs/{id}",
+    tag = "jobs",
+    summary = "Get job status",
+    params(("id" = String, Path, description = "Job identifier returned by the submit endpoints")),
+    responses(
+        (status = 200, description = "Current job status", body = JobStatusResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
 async fn get_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -326,6 +585,21 @@ async fn get_job(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/jobs/{id}/result",
+    tag = "jobs",
+    summary = "Get completed query result",
+    params(("id" = String, Path, description = "Job identifier returned by the submit endpoints")),
+    responses(
+        (status = 200, description = "Completed query result", body = QueryResult),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse),
+        (status = 409, description = "Job is not complete, failed, or cancelled", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
 async fn get_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -364,6 +638,21 @@ async fn get_result(
     )))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/jobs/{id}/cancel",
+    tag = "jobs",
+    summary = "Cancel a job",
+    params(("id" = String, Path, description = "Job identifier returned by the submit endpoints")),
+    responses(
+        (status = 200, description = "Cancellation requested", body = CancelResponse),
+        (status = 401, description = "Missing or invalid API token", body = ErrorResponse),
+        (status = 404, description = "Job not found", body = ErrorResponse),
+        (status = 409, description = "Job already finished", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
 async fn cancel_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -400,64 +689,10 @@ async fn cancel_job(
     })))
 }
 
-fn openapi_document(base_url: &str) -> OpenApi {
-    let value = json!({
-        "openapi": "3.1.0",
-        "info": {
-            "title": "Broadcast Archive Query Service (BAQS)",
-            "version": env!("CARGO_PKG_VERSION"),
-            "description": "Asynchronous broadcast archive fingerprint search and query service."
-        },
-        "servers": [{ "url": base_url.trim_end_matches('/') }],
-        "paths": {
-            "/v1/search": {
-                "post": {
-                    "summary": "Submit an asynchronous archive search",
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueryRequest" } } } },
-                    "responses": { "202": { "description": "Job accepted" }, "400": { "description": "Invalid request" }, "401": { "description": "Unauthorized" } }
-                }
-            },
-            "/v1/query": {
-                "post": {
-                    "summary": "Submit an asynchronous platform query (contract v2)",
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QueryRequest" } } } },
-                    "responses": { "202": { "description": "Job accepted" }, "400": { "description": "Invalid request" }, "401": { "description": "Unauthorized" } }
-                }
-            },
-            "/v1/jobs/{id}": {
-                "get": {
-                    "summary": "Get job status",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "responses": { "200": { "description": "Job status" }, "404": { "description": "Not found" } }
-                }
-            },
-            "/v1/jobs/{id}/result": {
-                "get": {
-                    "summary": "Get completed query result",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "responses": { "200": { "description": "Query result" }, "409": { "description": "Not ready or failed" } }
-                }
-            },
-            "/v1/jobs/{id}/cancel": {
-                "post": {
-                    "summary": "Cancel a job",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "responses": { "200": { "description": "Cancellation requested" }, "409": { "description": "Already finished" } }
-                }
-            },
-            "/healthz": { "get": { "summary": "Liveness", "responses": { "200": { "description": "OK" } } } },
-            "/readyz": { "get": { "summary": "Readiness", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } }
-        },
-        "components": {
-            "schemas": {
-                "QueryRequest": { "type": "object" },
-                "CatalogReference": { "type": "object" },
-                "ArchiveReference": { "type": "object" },
-                "QueryOptions": { "type": "object" }
-            }
-        }
-    });
-    serde_json::from_value(value).expect("valid OpenAPI document")
+fn openapi_document() -> OpenApiDocument {
+    let mut document = ApiDoc::openapi();
+    document.servers = Some(vec![Server::new(PUBLIC_BASE_URL)]);
+    document
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -521,4 +756,119 @@ fn empty_progress() -> JobProgress {
 #[allow(dead_code)]
 fn empty_result() -> Option<QueryResult> {
     None
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_document_is_aligned_with_api() {
+        let document = openapi_document();
+        let value = serde_json::to_value(&document).expect("serializable OpenAPI document");
+
+        assert_eq!(value["servers"][0]["url"], PUBLIC_BASE_URL);
+
+        for path in [
+            "/v1/search",
+            "/v1/query",
+            "/v1/jobs/{id}",
+            "/v1/jobs/{id}/result",
+            "/v1/jobs/{id}/cancel",
+            "/healthz",
+            "/readyz",
+            "/version",
+        ] {
+            assert!(value["paths"].get(path).is_some(), "missing path {path}");
+        }
+
+        let schemas = &value["components"]["schemas"];
+        for schema in [
+            "QueryRequest",
+            "CatalogReference",
+            "ArchiveReference",
+            "IndexObjectReference",
+            "QueryOptions",
+            "JobSubmissionResponse",
+            "JobStatusResponse",
+            "JobProgress",
+            "JobError",
+            "QueryResult",
+            "QueryMatch",
+            "QuerySummary",
+            "Recording",
+            "Stream",
+            "Provenance",
+            "ErrorResponse",
+        ] {
+            assert!(
+                schemas.get(schema).is_some(),
+                "missing component schema {schema}"
+            );
+        }
+        assert!(
+            schemas["QueryRequest"]["properties"]
+                .get("contract_version")
+                .is_some()
+        );
+        assert!(
+            schemas["CatalogReference"]["properties"]
+                .get("type")
+                .is_some()
+        );
+        assert!(
+            schemas["QueryOptions"]["properties"]
+                .get("minimum_confidence")
+                .is_some()
+        );
+
+        let schemes = &value["components"]["securitySchemes"];
+        assert!(schemes.get("bearer_auth").is_some());
+        assert!(schemes.get("api_key").is_some());
+
+        for path in [
+            "/v1/search",
+            "/v1/query",
+            "/v1/jobs/{id}",
+            "/v1/jobs/{id}/result",
+            "/v1/jobs/{id}/cancel",
+        ] {
+            let operation = value["paths"][path]
+                .as_object()
+                .and_then(|value| value.values().next())
+                .expect("path operation");
+            assert!(
+                operation["security"]
+                    .as_array()
+                    .is_some_and(|value| value.len() == 2),
+                "{path} must document bearer and api-key auth"
+            );
+        }
+
+        for path in ["/healthz", "/readyz", "/version"] {
+            let operation = value["paths"][path]
+                .as_object()
+                .and_then(|value| value.values().next())
+                .expect("health operation");
+            assert!(
+                operation.get("security").is_none(),
+                "{path} must remain public in the documentation"
+            );
+        }
+
+        for path in ["/v1/query", "/v1/search"] {
+            let content =
+                &value["paths"][path]["post"]["requestBody"]["content"]["application/json"];
+            assert!(
+                content.get("example").is_some() || content.get("examples").is_some(),
+                "{path} must include sample POST data"
+            );
+            let example = content
+                .get("example")
+                .expect("single request example")
+                .clone();
+            let request: QueryRequest =
+                serde_json::from_value(example).expect("sample request must parse");
+            request.validate().expect("sample request must be valid");
+        }
+    }
 }

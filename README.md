@@ -85,6 +85,7 @@ BAQS_S3_SECRET_KEY=...
 Important config sections:
 
 - `[server]`: bind address, public base URL, API token, health visibility.
+  `public_base_url` defaults to `https://baqs.spaza.co.ke`.
 - `[storage]`: R2/S3 endpoint/bucket/credentials and `archive_prefix`.
 - `[olaf]`: binary path, map size, timeout, sample rate, step size.
 - `[worker]`: concurrency, job lease, polling, cleanup.
@@ -99,13 +100,20 @@ until credentials are supplied.
 
 ## HTTP API
 
-Authentication: `Authorization: Bearer ${BAQS_API_TOKEN}`. Health endpoints are
-public by default.
+Authentication: `Authorization: Bearer ${BAQS_API_TOKEN}` or
+`x-api-key: ${BAQS_API_TOKEN}`. `/v1/*` endpoints are protected whenever a token
+is configured. Health endpoints are public by default (`health_public = true`);
+`/version`, `/docs`, and `/openapi.json` are always public.
+
+The public API base URL is `https://baqs.spaza.co.ke`. The OpenAPI document uses
+this URL as its server. `scripts/update.sh` migrates an existing
+`public_base_url = "http://127.0.0.1:8080"` value automatically; other custom
+values must be updated manually in `/etc/baqs/config.toml`.
 
 ### Submit a query
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/query \
+curl -X POST https://baqs.spaza.co.ke/v1/query \
   -H "authorization: Bearer $BAQS_API_TOKEN" \
   -H "content-type: application/json" \
   -d '{
@@ -133,9 +141,9 @@ Response (`202`):
   "contract_version": "2",
   "request_id": "req-1",
   "job_id": "...",
-  "status": "queued",
-  "status_url": "/v1/jobs/...",
-  "result_url": "/v1/jobs/.../result"
+  "status": "accepted",
+  "status_url": "https://baqs.spaza.co.ke/v1/jobs/...",
+  "result_url": "https://baqs.spaza.co.ke/v1/jobs/.../result"
 }
 ```
 
@@ -143,28 +151,42 @@ Response (`202`):
 
 ```bash
 curl -H "authorization: Bearer $BAQS_API_TOKEN" \
-  http://127.0.0.1:8080/v1/jobs/<job_id>
+  https://baqs.spaza.co.ke/v1/jobs/<job_id>
 
 curl -H "authorization: Bearer $BAQS_API_TOKEN" \
-  http://127.0.0.1:8080/v1/jobs/<job_id>/result
+  https://baqs.spaza.co.ke/v1/jobs/<job_id>/result
 
 curl -X POST -H "authorization: Bearer $BAQS_API_TOKEN" \
-  http://127.0.0.1:8080/v1/jobs/<job_id>/cancel
+  https://baqs.spaza.co.ke/v1/jobs/<job_id>/cancel
 ```
 
 ### Other endpoints
 
-- `POST /v1/search` — alias of `/v1/query`.
-- `GET /healthz` — process liveness.
-- `GET /readyz` — SQLite, data directory, Olaf, ffmpeg/ffprobe, storage, workers.
-- `GET /version` — service/contract version.
-- `GET /openapi.json` — OpenAPI document.
-- `GET /docs` — Swagger UI.
+- `POST /v1/search` — alias of `/v1/query`; jobs are recorded with kind `search`.
+- `GET /healthz` — process liveness (public by default).
+- `GET /readyz` — SQLite, data directory, Olaf, ffmpeg/ffprobe, storage, workers
+  (public by default).
+- `GET /version` — service/contract version (always public).
+- `GET /openapi.json` — OpenAPI document, including request examples (always public).
+- `GET /docs` — Swagger UI, preconfigured with the production server and auth
+  schemes (always public).
+
+In Swagger UI, click **Authorize** and paste the token for either `bearer_auth`
+or `api_key`. `POST /v1/query` and `POST /v1/search` include complete sample
+request bodies that can be executed with **Try it out**.
 
 ## Query ranges
 
-`start`/`end` are RFC 3339 timestamps. Alternatively pass `month: "YYYY-MM"`
-for a full UTC month. Archive manifests are discovered by listing
+`start`/`end` accept RFC 3339 timestamps, `YYYY-MM-DD` dates, or epoch
+milliseconds. Alternatively pass `month: "YYYY-MM"` for a full UTC month.
+`month` cannot be combined with `start`/`end`, and at least one of `month`,
+`start`, or `end` is required.
+
+Requests should include a stream selector via `stream_id`,
+`external_stream_id`, `stream_ids`, or `archives[].stream_id`. Without one,
+discovery scans all manifests in the selected range and may be very expensive.
+
+Archive manifests are discovered by listing
 `archives/<node>/manifests/<YYYY-MM-DD>/` prefixes and downloading their JSON
 manifests. Only index objects ending in `data.mdb` are used.
 
@@ -173,9 +195,8 @@ Chunks are grouped by stream and UTC day. Each time index is shifted by
 merged LMDB, and `olaf_resource_map` paths are rewritten to canonical chunk
 paths. Matches are mapped back to absolute timestamps using the day start.
 
-Request `stream_ids`, `sources.stream_ids`, and `stream_id` are matched against
-both manifest `stream_id` and `external_stream_id`. A stream selector is
-required so archive discovery stays bounded.
+Request `stream_ids`, `stream_id`, and `external_stream_id` are matched against
+both manifest `stream_id` and `external_stream_id`.
 
 ## Results
 
