@@ -4,16 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{
-    Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
-};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use futures_util::StreamExt;
 use lmdb::{Cursor, DatabaseFlags, Environment, Transaction, WriteFlags};
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectPath;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -56,7 +55,7 @@ pub struct Pipeline {
 
 #[derive(Clone)]
 struct Storage {
-    client: Client,
+    store: Arc<dyn ObjectStore>,
     bucket: String,
     prefix: String,
 }
@@ -1236,143 +1235,102 @@ fn merge_unique(target: &mut Vec<String>, values: Vec<String>) {
     }
 }
 
+fn object_path(prefix: &str) -> Option<ObjectPath> {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(ObjectPath::from(trimmed))
+    }
+}
+
 impl Storage {
     async fn new(config: &Config) -> Result<Self> {
         let storage = &config.storage;
-        let credentials = Credentials::new(
-            storage.access_key.trim(),
-            storage.secret_key.trim(),
-            None,
-            None,
-            "baqs-storage",
-        );
+        let bucket = storage.bucket.trim();
         let region = if storage.region.trim().is_empty() {
             "auto".to_string()
         } else {
             storage.region.trim().to_string()
         };
-        let mut shared_builder = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(region.clone()))
-            .credentials_provider(credentials);
-        if !storage.endpoint.trim().is_empty() {
-            shared_builder = shared_builder.endpoint_url(storage.endpoint.trim());
+        let builder_bucket = if bucket.is_empty() {
+            "unconfigured"
+        } else {
+            bucket
+        };
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(builder_bucket)
+            .with_region(region)
+            .with_access_key_id(storage.access_key.trim())
+            .with_secret_access_key(storage.secret_key.trim())
+            .with_virtual_hosted_style_request(!storage.force_path_style);
+        let endpoint = storage.endpoint.trim();
+        if !endpoint.is_empty() {
+            builder = builder
+                .with_endpoint(endpoint)
+                .with_allow_http(endpoint.starts_with("http://"));
         }
-        let shared = shared_builder.load().await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&shared)
-            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-            .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
-        if !storage.endpoint.trim().is_empty() {
-            builder = builder.endpoint_url(storage.endpoint.trim());
-        }
-        if storage.force_path_style {
-            builder = builder.force_path_style(true);
-        }
+        let store = builder.build().context("configuring S3 storage")?;
         Ok(Self {
-            client: Client::from_conf(builder.build()),
-            bucket: storage.bucket.trim().to_string(),
+            store: Arc::new(store),
+            bucket: bucket.to_string(),
             prefix: storage.archive_prefix.trim().trim_matches('/').to_string(),
         })
     }
 
     async fn list_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut result = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let response = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix)
-                .delimiter("/")
-                .set_continuation_token(token.clone())
-                .send()
-                .await
-                .with_context(|| format!("listing prefixes under {prefix}"))?;
-            for item in response.common_prefixes() {
-                if let Some(value) = item.prefix() {
-                    result.push(value.to_string());
-                }
-            }
-            if response.is_truncated().unwrap_or(false) {
-                token = response.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(result)
+        let path = object_path(prefix);
+        let result = self
+            .store
+            .list_with_delimiter(path.as_ref())
+            .await
+            .with_context(|| format!("listing prefixes under {prefix}"))?;
+        Ok(result
+            .common_prefixes
+            .into_iter()
+            .map(|value| format!("{value}/"))
+            .collect())
     }
 
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        let path = object_path(prefix);
+        let mut objects = self.store.list(path.as_ref());
         let mut result = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let response = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix)
-                .set_continuation_token(token.clone())
-                .send()
-                .await
-                .with_context(|| format!("listing objects under {prefix}"))?;
-            for item in response.contents() {
-                if let Some(key) = item.key() {
-                    result.push(key.to_string());
-                }
-            }
-            if response.is_truncated().unwrap_or(false) {
-                token = response.next_continuation_token().map(str::to_string);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
+        while let Some(item) = objects.next().await {
+            let meta = item.with_context(|| format!("listing objects under {prefix}"))?;
+            result.push(meta.location.to_string());
         }
         Ok(result)
     }
 
     async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
+        let path = ObjectPath::from(key.trim_start_matches('/'));
+        let result = self
+            .store
+            .get_opts(&path, Default::default())
             .await
             .with_context(|| format!("downloading s3://{}/{}", self.bucket, key))?;
-        let bytes = response
-            .body
-            .collect()
+        let bytes = result
+            .bytes()
             .await
-            .with_context(|| format!("reading s3://{}/{}", self.bucket, key))?
-            .into_bytes();
+            .with_context(|| format!("reading s3://{}/{}", self.bucket, key))?;
         Ok(bytes.to_vec())
     }
 
     async fn download_object(&self, key: &str, path: &Path) -> Result<()> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
+        let object = ObjectPath::from(key.trim_start_matches('/'));
+        let result = self
+            .store
+            .get_opts(&object, Default::default())
             .await
             .with_context(|| format!("downloading s3://{}/{}", self.bucket, key))?;
-        let mut reader = response.body.into_async_read();
+        let mut stream = result.into_stream();
         let mut file = tokio::fs::File::create(path)
             .await
             .with_context(|| format!("creating {}", path.display()))?;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            let read = reader.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            file.write_all(&buffer[..read]).await?;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("reading s3://{}/{}", self.bucket, key))?;
+            file.write_all(&chunk).await?;
         }
         file.flush().await?;
         Ok(())

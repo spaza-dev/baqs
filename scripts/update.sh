@@ -20,6 +20,21 @@ export PATH="$CARGO_HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 log() { echo; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 fail() { echo; echo "ERROR: $*" >&2; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+build_jobs() {
+    if [[ -n "${BAQS_BUILD_JOBS:-}" ]]; then
+        printf '%s\n' "$BAQS_BUILD_JOBS"
+        return 0
+    fi
+    local mem_gb
+    mem_gb="$(awk '/MemTotal/ { printf "%d", $2 / 1024 / 1024 }' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ "$mem_gb" -le 2 ]]; then
+        printf '1\n'
+    elif [[ "$mem_gb" -le 4 ]]; then
+        printf '2\n'
+    else
+        nproc 2>/dev/null || printf '1\n'
+    fi
+}
 
 echo "======================================"
 echo " BAQS Updater"
@@ -42,7 +57,9 @@ command_exists cargo || fail "Cargo installation failed."
 log "[2/6] Building BAQS..."
 cd "$SOURCE_DIR"
 [[ -f Cargo.toml ]] || fail "Cargo.toml not found in $SOURCE_DIR."
-cargo build --release
+JOBS="$(build_jobs)"
+log "Building with $JOBS parallel job(s)..."
+cargo build --release --jobs "$JOBS"
 BINARY="$SOURCE_DIR/target/release/baqs"
 [[ -x "$BINARY" ]] || fail "BAQS binary was not generated."
 

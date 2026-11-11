@@ -11,7 +11,7 @@ jobs; HTTP callers submit, poll, cancel, and fetch results.
 
 ## Stack
 
-- Rust, axum, rusqlite, lmdb, aws-sdk-s3, reqwest
+- Rust, axum, rusqlite, lmdb, object_store (S3/R2), reqwest
 - Olaf CLI for fingerprinting/querying
 - ffmpeg/ffprobe for recording duration probing
 - systemd for deployment
