@@ -1,0 +1,40 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment and secrets
+.env
+.env.*
+*.env
+!.env.example
+**/baqs.env
+
+# Runtime data / config
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/data/
+*.toml.local
+**/config.toml
+
+# Logs
+*.log
+/logs/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test / coverage output
+/coverage/
+*.profraw
